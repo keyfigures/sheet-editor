@@ -1,0 +1,283 @@
+diff --git a/lib/converter.ts b/lib/converter.ts
+index d765747..1752e2c 100644
+--- a/lib/converter.ts
++++ b/lib/converter.ts
+@@ -1,3 +1,4 @@
++import { isEmbedMode } from './embed-mode';
+ import { t } from '@ranuts/shared/i18n';
+ import { X2TConverter, isHtmlDocument, preprocessDocxRuby } from '@ranuts/converter';
+ import { createEditorInstance, loadEditorApi } from './onlyoffice-editor';
+@@ -105,7 +106,7 @@ export async function handleDocumentOperation(options: {
+   } catch (error: any) {
+     if (error?.name === 'AbortError') throw error;
+     console.error(`${t('documentOperationFailed')}`, error);
+-    alert(`${t('documentOperationFailed')}${error.message}`);
++    if (!isEmbedMode()) alert(`${t('documentOperationFailed')}${error.message}`);
+     throw error;
+   }
+ }
+diff --git a/lib/embed-api.ts b/lib/embed-api.ts
+index d17a808..cb805c9 100644
+--- a/lib/embed-api.ts
++++ b/lib/embed-api.ts
+@@ -5,6 +5,7 @@ import { getDocmentObj, setDocmentObj } from '@ranuts/shared/store';
+ import { handleDocumentOperation, loadEditorApi } from './converter';
+ import { openDocumentFromUrl } from './document';
+ import { getReadonlyMode, requestSaveDocument, setReadonlyMode } from './onlyoffice-editor';
++import { startKfBridge } from './kf-bridge';
+ import { captureSavePoint, commitSavePoint } from './onlyoffice/save-point';
+ import { hasUnsavedChanges, markDocumentSaved, onUnsavedChangesChange } from './unsaved-guard';
+ 
+@@ -51,7 +52,7 @@ function normalizeTargetOrigin(origin: string): string {
+   return origin && origin !== 'null' ? origin : '*';
+ }
+ 
+-function shouldAcceptMessage(event: MessageEvent): boolean {
++export function shouldAcceptMessage(event: MessageEvent): boolean {
+   if (event.source !== window.parent) return false;
+   const allowedOrigin = getQueryValue('embedOrigin');
+   if (allowedOrigin && event.origin !== allowedOrigin) return false;
+@@ -276,6 +277,9 @@ export function initEmbedApi(): void {
+     void handleMessage(event);
+   });
+ 
++  // No named parent, no bridge: it posts link addresses, and only ever to the exact origin.
++  if (acceptedParentOrigin) startKfBridge(shouldAcceptMessage, (type, payload) => postToParent(type, payload));
++
+   window.addEventListener('load', () => {
+     postToParent('document:ready');
+   });
+diff --git a/lib/kf-bridge.ts b/lib/kf-bridge.ts
+new file mode 100644
+index 0000000..f2371d2
+--- /dev/null
++++ b/lib/kf-bridge.ts
+@@ -0,0 +1,197 @@
++import { DEFAULT_UI_THEME } from './onlyoffice/ui-theme';
++import { setEditorThemeFromApp } from './editor-theme';
++import { closeAbout, isAboutOpen } from './onlyoffice/guards/kf-chrome';
++import { swallowPrintAndSave } from './onlyoffice/guards/kf-lock';
++
++/**
++ * THE APP'S END OF THE VIEWER. The app is on another origin and can only send messages; this is the other side of
++ * platform/web/lib/sheet-editor-protocol.mjs, and the two change together (bump PROTOCOL).
++ *
++ *   kf:ready   loaded AND locked, the only readiness the app trusts
++ *   kf:error   the open failed, as a kind, never the editor's words
++ *   kf:goto    a source chip: the sheet, then the range
++ *   kf:theme   the app's light or dark
++ *   kf:link    a link clicked in a cell, for the app to route
++ *   kf:key     a key the app's own window listeners need
++ */
++export const PROTOCOL = 1;
++const LINK_CLICK = 'asc_onHyperlinkClick';
++const OPEN_OVERLAY = '.dropdown-menu, .modal, .asc-window';
++
++type Api = {
++  isDocumentLoadComplete?: boolean;
++  isLoadFullApi?: boolean;
++  asc_getWorksheetsCount?: () => number;
++  asc_getWorksheetName?: (index: number) => string;
++  asc_isWorksheetHidden?: (index: number) => boolean;
++  asc_showWorksheet?: (index: number) => void;
++  asc_findCell?: (range: string) => void;
++  asc_getActiveWorksheetIndex?: () => number;
++  asc_setZoom?: (zoom: number) => void;
++  asc_registerCallback?: (name: string, callback: (...args: unknown[]) => void) => void;
++  wbModel?: {
++    getActiveWs?: () => {
++      selectionRange?: { activeCell?: { row: number; col: number } };
++      sheetViews?: { zoomScale?: number }[];
++    };
++  };
++  asc_SetSmoothScrolling?: (on: boolean) => void;
++  asc_Resize?: () => void;
++  isRestrictionView?: () => boolean;
++};
++type EditorWin = Window & typeof globalThis & { Asc?: { editor?: Api } };
++type Post = (type: string, payload?: Record<string, unknown>) => void;
++
++let post: Post = () => {};
++let ready = false;
++let reportedFailure = false;
++
++function editorWindow(): EditorWin | null {
++  for (let i = 0; i < window.frames.length; i++) {
++    try {
++      const win = window.frames[i] as EditorWin;
++      if (win.Asc?.editor) return win;
++    } catch {
++      // not the editor
++    }
++  }
++  return null;
++}
++
++function isLoaded(api: Api): boolean {
++  return Boolean(api.isDocumentLoadComplete && api.isLoadFullApi && (api.asc_getWorksheetsCount?.() ?? 0) > 0);
++}
++
++/**
++ * A SHEET'S SAVED ZOOM, as Excel has it: per sheet, kept in the file. The editor has one zoom for the whole workbook,
++ * so it is set again each time a sheet comes to the front. A sheet that saved none is at 100%.
++ */
++function applySavedZoom(api: Api): void {
++  const saved = api.wbModel?.getActiveWs?.()?.sheetViews?.[0]?.zoomScale;
++  api.asc_setZoom?.(saved ? saved / 100 : 1);
++}
++
++/**
++ * A LINK IN A CELL GOES TO THE APP, WHICH DECIDES. The editor sends every link click to one callback, whose vendor handler
++ * opens web and mail links and warns about the rest: so that handler never gets registered here, at the first sight of
++ * the API, before the vendor's deferred code asks. A link inside the workbook moves within it and never comes here.
++ */
++function takeOverLinks(api: Api): void {
++  const register = api.asc_registerCallback?.bind(api);
++  if (!register) return;
++  register(LINK_CLICK, (url?: unknown) => {
++    if (typeof url !== 'string' || !url) return;
++    const index = api.asc_getActiveWorksheetIndex?.() ?? 0;
++    const cell = api.wbModel?.getActiveWs?.()?.selectionRange?.activeCell;
++    post('kf:link', {
++      url,
++      sheet: api.asc_getWorksheetName?.(index) ?? '',
++      row: cell?.row ?? 0,
++      col: cell?.col ?? 0,
++    });
++  });
++  api.asc_registerCallback = (name, callback) => {
++    if (name !== LINK_CLICK) register(name, callback);
++  };
++}
++
++function goTo(payload: { sheet?: string | null; range?: string }): void {
++  const win = editorWindow();
++  const api = win?.Asc?.editor;
++  if (!api || !ready || typeof payload.range !== 'string') return;
++  try {
++    if (payload.sheet) {
++      let index = -1;
++      const count = api.asc_getWorksheetsCount?.() ?? 0;
++      for (let i = 0; i < count; i++) if (api.asc_getWorksheetName?.(i) === payload.sheet) index = i;
++      // An unknown or hidden sheet: stay where the reader is.
++      if (index < 0 || api.asc_isWorksheetHidden?.(index)) return;
++      if (api.asc_getActiveWorksheetIndex?.() !== index) api.asc_showWorksheet?.(index);
++    }
++    api.asc_findCell?.(payload.range);
++  } catch (error) {
++    console.warn('[kf] goto failed', error);
++  }
++}
++
++function isVisible(el: Element): boolean {
++  return (el as HTMLElement).offsetHeight > 0;
++}
++
++function overlayOpen(doc: Document): boolean {
++  return [...doc.querySelectorAll(OPEN_OVERLAY)].some(isVisible);
++}
++
++function typingInABox(doc: Document): boolean {
++  const el = doc.activeElement as HTMLElement | null;
++  if (!el || !isVisible(el)) return false;
++  // Not any textarea: the grid keeps its keyboard focus in one of its own (#area_id).
++  return el.tagName === 'INPUT' || el.id === 'ce-cell-content';
++}
++
++function forwardKeys(doc: Document, win: EditorWin | null): void {
++  doc.addEventListener(
++    'keydown',
++    (event) => {
++      const editor = win ?? editorWindow();
++      const inner = editor?.document;
++      if (event.key === 'Escape') {
++        if (editor && inner && isAboutOpen(inner)) {
++          closeAbout(editor);
++          return;
++        }
++        if (inner && overlayOpen(inner)) return;
++      } else {
++        const newChat = event.key.toLowerCase() === 'n' && (event.metaKey || event.ctrlKey);
++        const search = event.key === '/' && !event.metaKey && !event.ctrlKey && !event.altKey;
++        if (!newChat && !search) return;
++        if (inner && (overlayOpen(inner) || isAboutOpen(inner) || typingInABox(inner))) return;
++      }
++      post('kf:key', {
++        key: event.key,
++        metaKey: event.metaKey,
++        ctrlKey: event.ctrlKey,
++        shiftKey: event.shiftKey,
++        altKey: event.altKey,
++      });
++    },
++    { capture: true },
++  );
++}
++
++/** From the editor's onError: the app replaces the frame with its own sentence. Once. */
++export function reportOpenFailure(kind: 'corrupt' | 'memory' | 'other'): void {
++  if (reportedFailure) return;
++  reportedFailure = true;
++  post('kf:error', { kind });
++}
++
++export function startKfBridge(accept: (event: MessageEvent) => boolean, send: Post): void {
++  post = send;
++  swallowPrintAndSave(document);
++  forwardKeys(document, null);
++  window.addEventListener('message', (event) => {
++    if (!accept(event)) return;
++    const { type, payload } = (event.data ?? {}) as { type?: string; payload?: Record<string, never> };
++    if (type === 'kf:goto') goTo(payload ?? {});
++    else if (type === 'kf:theme') setEditorThemeFromApp(DEFAULT_UI_THEME, (payload as { theme?: string } | undefined)?.theme ?? null);
++  });
++  let linksTaken = false;
++  const timer = window.setInterval(() => {
++    const win = editorWindow();
++    const api = win?.Asc?.editor;
++    if (api && !linksTaken) {
++      linksTaken = true;
++      takeOverLinks(api);
++    }
++    if (!win || !api || !isLoaded(api) || !api.isRestrictionView?.()) return;
++    window.clearInterval(timer);
++    forwardKeys(win.document, win);
++    api.asc_SetSmoothScrolling?.(true);
++    api.asc_Resize?.();
++    applySavedZoom(api);
++    api.asc_registerCallback?.('asc_onActiveSheetChanged', () => applySavedZoom(api));
++    ready = true;
++    post('kf:ready', { protocol: PROTOCOL });
++  }, 100);
++}
+diff --git a/lib/onlyoffice-editor.ts b/lib/onlyoffice-editor.ts
+index b21b654..140d7c8 100644
+--- a/lib/onlyoffice-editor.ts
++++ b/lib/onlyoffice-editor.ts
+@@ -1,4 +1,5 @@
+ import { isEmbedMode } from './embed-mode';
++import { reportOpenFailure } from './kf-bridge';
+ import { getDocumentCloseRevision } from './document-open';
+ import 'ranui/message';
+ import { getOnlyOfficeLang, t } from '@ranuts/shared/i18n';
+@@ -332,6 +333,11 @@ function createPersonalEditorInstance(config: {
+         if (code === -82 && !isDocumentContentReady()) {
+           markDocumentOpenFailed(getDocumentOpenError() ?? getLastFrameError() ?? `editor reported error ${code}`);
+         }
++        // Embedded, the app tells the reader, in its own words. The vendor's text never shows.
++        if (isEmbedMode()) {
++          reportOpenFailure(outOfMemory ? 'memory' : code === -82 || code === -85 ? 'corrupt' : 'other');
++          return;
++        }
+         const detail = [code !== undefined ? `code ${code}` : '', data?.errorDescription].filter(Boolean).join(', ');
+         (window as unknown as { message?: { error?: (msg: string) => void } }).message?.error?.(
+           `${t('editorErrorToast')}${detail ? ` (${detail})` : ''}${hint}${cause}`,
+@@ -439,7 +445,7 @@ export async function loadEditorApi(): Promise<void> {
+     script.onload = () => resolve();
+     script.onerror = (error) => {
+       console.error('Failed to load OnlyOffice API:', error);
+-      alert(t('failedToLoadEditor'));
++      if (!isEmbedMode()) alert(t('failedToLoadEditor'));
+       reject(error);
+     };
+     document.head.appendChild(script);

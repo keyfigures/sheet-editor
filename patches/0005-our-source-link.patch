@@ -1,0 +1,13 @@
+diff --git a/lib/onlyoffice/guards/about-source.ts b/lib/onlyoffice/guards/about-source.ts
+index e2c6529..aa62e4f 100644
+--- a/lib/onlyoffice/guards/about-source.ts
++++ b/lib/onlyoffice/guards/about-source.ts
+@@ -12,7 +12,7 @@
+  * Legal text is additive; guards/chrome.ts hides only product branding.
+  */
+ const NOTICE_ID = 'oo-source-notice';
+-const SOURCE_URL = 'https://github.com/ranuts/document';
++const SOURCE_URL: string = import.meta.env.VITE_KF_SOURCE_URL;
+ const WATCHED = '__ranSourceNoticeWatched';
+ 
+ function renderNotice(doc: Document, panel: HTMLElement): void {

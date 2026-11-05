@@ -1,0 +1,204 @@
+diff --git a/lib/embed-api.ts b/lib/embed-api.ts
+index 6810c61..b434eeb 100644
+--- a/lib/embed-api.ts
++++ b/lib/embed-api.ts
+@@ -5,7 +5,7 @@ import { getDocmentObj, setDocmentObj } from '@ranuts/shared/store';
+ import { handleDocumentOperation, loadEditorApi } from './converter';
+ import { openDocumentFromUrl } from './document';
+ import { getReadonlyMode, requestSaveDocument, setReadonlyMode } from './onlyoffice-editor';
+-import { startKfBridge } from './kf-bridge';
++import { noteOpeningFile, startKfBridge } from './kf-bridge';
+ import { captureSavePoint, commitSavePoint } from './onlyoffice/save-point';
+ import { hasUnsavedChanges, markDocumentSaved, onUnsavedChangesChange } from './unsaved-guard';
+ 
+@@ -132,6 +132,7 @@ async function openFile(file: File, readonly = false): Promise<void> {
+   // No bytes means "new document" to the editor. The reader asked to see a file: a blank sheet would be a false answer.
+   // A .csv with nothing in it is a real, empty file.
+   if (file.size === 0 && !/\.csv$/i.test(file.name)) throw new Error('The file is empty');
++  noteOpeningFile(file);
+   const opening = beginDocumentOpen();
+   await loadEditorApi();
+   opening.assertCurrent();
+diff --git a/lib/kf-bridge.ts b/lib/kf-bridge.ts
+index f2371d2..d11dc3f 100644
+--- a/lib/kf-bridge.ts
++++ b/lib/kf-bridge.ts
+@@ -2,6 +2,7 @@ import { DEFAULT_UI_THEME } from './onlyoffice/ui-theme';
+ import { setEditorThemeFromApp } from './editor-theme';
+ import { closeAbout, isAboutOpen } from './onlyoffice/guards/kf-chrome';
+ import { swallowPrintAndSave } from './onlyoffice/guards/kf-lock';
++import { unmentionedColumns } from './kf-sheet-columns';
+ 
+ /**
+  * THE APP'S END OF THE VIEWER. The app is on another origin and can only send messages; this is the other side of
+@@ -29,7 +30,11 @@ type Api = {
+   asc_getActiveWorksheetIndex?: () => number;
+   asc_setZoom?: (zoom: number) => void;
+   asc_registerCallback?: (name: string, callback: (...args: unknown[]) => void) => void;
++  wb?: { getWorksheet?: () => { changeWorksheet?: (kind: string, options: unknown) => void } | undefined };
+   wbModel?: {
++    getWorksheet?: (index: number) =>
++      | { _getCol?: (index: number) => { setHidden?: (hidden: boolean | null) => void } | undefined }
++      | undefined;
+     getActiveWs?: () => {
+       selectionRange?: { activeCell?: { row: number; col: number } };
+       sheetViews?: { zoomScale?: number }[];
+@@ -95,6 +100,26 @@ function takeOverLinks(api: Api): void {
+   };
+ }
+ 
++let columnsToShow: Promise<Map<string, number[]>> | null = null;
++
++/** Called with the file as it opens: see lib/kf-sheet-columns.ts. */
++export function noteOpeningFile(file: File): void {
++  columnsToShow = unmentionedColumns(file);
++}
++
++function showColumns(api: Api, wanted: Map<string, number[]>): void {
++  if (!wanted.size) return;
++  const count = api.asc_getWorksheetsCount?.() ?? 0;
++  for (let i = 0; i < count; i++) {
++    const columns = wanted.get(api.asc_getWorksheetName?.(i) ?? '');
++    if (!columns) continue;
++    const sheet = api.wbModel?.getWorksheet?.(i);
++    // Its own record, or the editor's setters skip it: they only walk columns that have one.
++    for (const c of columns) sheet?._getCol?.(c)?.setHidden?.(null);
++  }
++  api.wb?.getWorksheet?.()?.changeWorksheet?.('update', { reinitRanges: true });
++}
++
+ function goTo(payload: { sheet?: string | null; range?: string }): void {
+   const win = editorWindow();
+   const api = win?.Asc?.editor;
+@@ -186,6 +211,13 @@ export function startKfBridge(accept: (event: MessageEvent) => boolean, send: Po
+     }
+     if (!win || !api || !isLoaded(api) || !api.isRestrictionView?.()) return;
+     window.clearInterval(timer);
++    void finishOpening(win, api);
++  }, 100);
++}
++
++async function finishOpening(win: EditorWin, api: Api): Promise<void> {
++  showColumns(api, (await columnsToShow) ?? new Map());
++  {
+     forwardKeys(win.document, win);
+     api.asc_SetSmoothScrolling?.(true);
+     api.asc_Resize?.();
+@@ -193,5 +225,5 @@ export function startKfBridge(accept: (event: MessageEvent) => boolean, send: Po
+     api.asc_registerCallback?.('asc_onActiveSheetChanged', () => applySavedZoom(api));
+     ready = true;
+     post('kf:ready', { protocol: PROTOCOL });
+-  }, 100);
++  }
+ }
+diff --git a/lib/kf-sheet-columns.ts b/lib/kf-sheet-columns.ts
+new file mode 100644
+index 0000000..b177337
+--- /dev/null
++++ b/lib/kf-sheet-columns.ts
+@@ -0,0 +1,105 @@
++/**
++ * COLUMNS A FILE NEVER MENTIONS, BEFORE A RANGE THAT HIDES EVERYTHING TO THE RIGHT.
++ *
++ * A file's trailing "columns 9 to the end are hidden" becomes the editor's whole-sheet default, so every earlier column
++ * with no entry of its own was hidden too: a model's company name in column B and whole data columns simply were not
++ * drawn. Excel shows those at the default width. The editor's model has folded the ranges together by then and can no
++ * longer tell them from columns the file really hid, so this reads the file's own list, in this browser, from the bytes
++ * it already holds. It reads only the head of each sheet, up to the cell data. Anything unexpected means no change.
++ */
++const LAST_COLUMN = 16384;
++
++type Entry = { method: number; size: number; offset: number };
++
++function centralDirectory(bytes: Uint8Array): Map<string, Entry> {
++  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
++  let end = bytes.length - 22;
++  while (end >= 0 && view.getUint32(end, true) !== 0x06054b50) end--;
++  const entries = new Map<string, Entry>();
++  if (end < 0) return entries;
++  const count = view.getUint16(end + 10, true);
++  let at = view.getUint32(end + 16, true);
++  const decoder = new TextDecoder();
++  for (let i = 0; i < count && view.getUint32(at, true) === 0x02014b50; i++) {
++    const nameLength = view.getUint16(at + 28, true);
++    entries.set(decoder.decode(bytes.subarray(at + 46, at + 46 + nameLength)), {
++      method: view.getUint16(at + 10, true),
++      size: view.getUint32(at + 20, true),
++      offset: view.getUint32(at + 42, true),
++    });
++    at += 46 + nameLength + view.getUint16(at + 30, true) + view.getUint16(at + 32, true);
++  }
++  return entries;
++}
++
++/** The part as text, stopping as soon as `until` appears: a sheet's cell data can be very large. */
++async function readPart(bytes: Uint8Array, entry: Entry, until?: string): Promise<string> {
++  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
++  const start = entry.offset + 30 + view.getUint16(entry.offset + 26, true) + view.getUint16(entry.offset + 28, true);
++  const raw = bytes.subarray(start, start + entry.size);
++  if (entry.method === 0) return new TextDecoder().decode(raw);
++  const stream = new Blob([raw]).stream().pipeThrough(new DecompressionStream('deflate-raw'));
++  const reader = stream.pipeThrough(new TextDecoderStream()).getReader();
++  let text = '';
++  for (;;) {
++    const { done, value } = await reader.read();
++    if (done) break;
++    text += value;
++    if (until && text.includes(until)) {
++      void reader.cancel().catch(() => {});
++      break;
++    }
++  }
++  return text;
++}
++
++const attribute = (tag: string, name: string): string | null =>
++  new RegExp(`\\b${name}="([^"]*)"`).exec(tag)?.[1] ?? null;
++
++/** 0-based columns to show, by sheet name. Exported for its test. */
++export function columnsToShow(colsXml: string): number[] {
++  const ranges = [...colsXml.matchAll(/<(?:\w+:)?col\s[^>]*>/g)].map((m) => ({
++    min: Number(attribute(m[0], 'min')),
++    max: Number(attribute(m[0], 'max')),
++    hidden: ['1', 'true'].includes(attribute(m[0], 'hidden') ?? ''),
++  }));
++  const trailing = ranges.find((r) => r.hidden && r.max >= LAST_COLUMN);
++  if (!trailing) return [];
++  const show: number[] = [];
++  for (let column = 1; column < trailing.min; column++) {
++    if (!ranges.some((r) => column >= r.min && column <= r.max)) show.push(column - 1);
++  }
++  return show;
++}
++
++export async function unmentionedColumns(file: File): Promise<Map<string, number[]>> {
++  const result = new Map<string, number[]>();
++  if (!/\.xls[xm]$/i.test(file.name)) return result;
++  try {
++    const bytes = new Uint8Array(await file.arrayBuffer());
++    const parts = centralDirectory(bytes);
++    const book = parts.get('xl/workbook.xml');
++    const rels = parts.get('xl/_rels/workbook.xml.rels');
++    if (!book || !rels) return result;
++    const bookXml = new DOMParser().parseFromString(await readPart(bytes, book), 'application/xml');
++    const relsXml = new DOMParser().parseFromString(await readPart(bytes, rels), 'application/xml');
++    const targets = new Map(
++      [...relsXml.getElementsByTagName('Relationship')].map((r) => [r.getAttribute('Id'), r.getAttribute('Target')]),
++    );
++    for (const sheet of [...bookXml.getElementsByTagName('*')].filter((e) => e.localName === 'sheet')) {
++      const id = sheet.getAttribute('r:id');
++      const name = sheet.getAttribute('name');
++      const target = id ? targets.get(id) : null;
++      if (!name || !target) continue;
++      const path = target.startsWith('/') ? target.slice(1) : `xl/${target}`;
++      const part = parts.get(path);
++      if (!part) continue;
++      const head = await readPart(bytes, part, 'sheetData');
++      const show = columnsToShow(/<(?:\w+:)?cols>[\s\S]*?<\/(?:\w+:)?cols>/.exec(head)?.[0] ?? '');
++      if (show.length) result.set(name, show);
++    }
++  } catch (error) {
++    console.warn('[kf] could not read the column list', error);
++  }
++  return result;
++}

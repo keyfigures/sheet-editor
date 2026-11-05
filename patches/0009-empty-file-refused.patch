@@ -1,0 +1,14 @@
+diff --git a/lib/embed-api.ts b/lib/embed-api.ts
+index cb805c9..6810c61 100644
+--- a/lib/embed-api.ts
++++ b/lib/embed-api.ts
+@@ -129,6 +129,9 @@ function makeFileFromPayload(payload: Record<string, any>): File {
+ }
+ 
+ async function openFile(file: File, readonly = false): Promise<void> {
++  // No bytes means "new document" to the editor. The reader asked to see a file: a blank sheet would be a false answer.
++  // A .csv with nothing in it is a real, empty file.
++  if (file.size === 0 && !/\.csv$/i.test(file.name)) throw new Error('The file is empty');
+   const opening = beginDocumentOpen();
+   await loadEditorApi();
+   opening.assertCurrent();

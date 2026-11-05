@@ -1,0 +1,148 @@
+diff --git a/lib/onlyoffice/guards/chrome.ts b/lib/onlyoffice/guards/chrome.ts
+index 42b6cce..dadbf53 100644
+--- a/lib/onlyoffice/guards/chrome.ts
++++ b/lib/onlyoffice/guards/chrome.ts
+@@ -21,7 +21,7 @@ export function injectLocalChromeCss(doc: Document): void {
+     // cannot: the thumbnails panel and the SDK's own canvas geometry.
+     style.textContent = [
+       '.btn-current-user, #tlb-box-users { display: none !important; }',
+-      '#header-logo, .brand-logo, .asc-about-office, #id-about-company-logo { display: none !important; }',
++      '#header-logo { display: none !important; }',
+       '#id-about-licensor-logo .asc-about-version:not(#id-about-licensor-version-name) { display: none !important; }',
+       `@media (max-width: ${COMPACT_VIEWPORT_MAX_WIDTH}px), (pointer: coarse) and (max-height: ${COMPACT_VIEWPORT_MAX_WIDTH}px) {`,
+       '  [data-layout-name="rightMenu"] { display: none !important; }',
+diff --git a/lib/onlyoffice/guards/kf-chrome.ts b/lib/onlyoffice/guards/kf-chrome.ts
+new file mode 100644
+index 0000000..449d1b2
+--- /dev/null
++++ b/lib/onlyoffice/guards/kf-chrome.ts
+@@ -0,0 +1,86 @@
++import { isEmbedMode } from '../../embed-mode';
++
++/**
++ * ABOUT, FROM THE STATUS BAR. The viewer has no File menu or left rail, and the licence, the logo and the source link
++ * must stay reachable (AGPL-3.0 section 5(d) and 13, ONLYOFFICE's section 7 terms). One small text beside the zoom opens
++ * the editor's own About panel; a close control and Escape close it.
++ */
++const LINK_ID = 'kf-about-link';
++const CLOSE_ID = 'kf-about-close';
++const CSS = `
++  #${LINK_ID} { position: absolute; top: 0; height: 100%; display: flex; align-items: center; padding: 0 8px;
++    font-size: 11px; cursor: pointer; color: var(--text-normal, #444); z-index: 1; user-select: none; }
++  #${LINK_ID}:hover { text-decoration: underline; }
++  #about-menu-panel { position: absolute !important; left: 0; top: 0; bottom: 0; width: min(440px, 100%) !important;
++    z-index: 1000; overflow: auto; padding: 16px; box-sizing: border-box;
++    background: var(--background-normal, #fff); color: var(--text-normal, #444);
++    box-shadow: 0 2px 12px rgba(0, 0, 0, 0.2); }
++  #${CLOSE_ID} { position: absolute; top: 8px; right: 8px; border: 0; background: none; font-size: 18px; line-height: 1;
++    cursor: pointer; color: inherit; }
++`;
++
++type Button = { pressed?: boolean; toggle?: (state: boolean) => void; setDisabled?: (state: boolean) => void };
++type EditorWin = Window & {
++  SSE?: { getController?: (name: string) => { leftMenu?: { btnAbout?: Button } } | undefined };
++  __kfChrome?: boolean;
++};
++
++function aboutButton(win: Window): Button | undefined {
++  return (win as EditorWin).SSE?.getController?.('LeftMenu')?.leftMenu?.btnAbout;
++}
++
++export function isAboutOpen(doc: Document): boolean {
++  const panel = doc.getElementById('about-menu-panel');
++  return Boolean(panel && panel.offsetHeight > 0);
++}
++
++export function closeAbout(win: Window): void {
++  aboutButton(win)?.toggle?.(false);
++}
++
++function openAbout(win: Window): void {
++  const button = aboutButton(win);
++  if (!button) return;
++  button.setDisabled?.(false);
++  button.toggle?.(true);
++  const doc = win.document;
++  const panel = doc.getElementById('about-menu-panel');
++  if (panel && !doc.getElementById(CLOSE_ID)) {
++    const close = doc.createElement('button');
++    close.id = CLOSE_ID;
++    close.type = 'button';
++    close.title = 'Close';
++    close.textContent = '×';
++    close.addEventListener('click', () => closeAbout(win));
++    panel.appendChild(close);
++  }
++}
++
++export function installKfChrome(win: Window): boolean {
++  if (!isEmbedMode()) return true;
++  const w = win as EditorWin;
++  if (w.__kfChrome) return true;
++  const doc = win.document;
++  const bar = doc.querySelector<HTMLElement>('.statusbar');
++  const zoom = doc.getElementById('status-zoom-box');
++  if (!bar || !zoom || !aboutButton(win)) return false;
++  w.__kfChrome = true;
++  const style = doc.createElement('style');
++  style.textContent = CSS;
++  (doc.head || doc.documentElement).appendChild(style);
++  const link = doc.createElement('a');
++  link.id = LINK_ID;
++  link.textContent = 'About';
++  link.addEventListener('click', () => openAbout(win));
++  bar.appendChild(link);
++  // The sheet tabs stop short of it.
++  const place = (): void => {
++    const room = zoom.offsetWidth;
++    link.style.right = `${room}px`;
++    const strip = doc.getElementById('status-sheets-bar-box');
++    if (strip) strip.style.setProperty('right', `${room + link.offsetWidth}px`, 'important');
++  };
++  place();
++  new (win as unknown as { ResizeObserver: typeof ResizeObserver }).ResizeObserver(place).observe(zoom);
++  return true;
++}
+diff --git a/lib/onlyoffice/iframe-guards.ts b/lib/onlyoffice/iframe-guards.ts
+index b6ce1a8..52cec26 100644
+--- a/lib/onlyoffice/iframe-guards.ts
++++ b/lib/onlyoffice/iframe-guards.ts
+@@ -17,6 +17,7 @@ import { installAboutSourceNotice } from './guards/about-source';
+ import { installBadImageUrlGuard } from './guards/bad-image-url';
+ import { installX2tWorkerProxy } from './guards/x2t-worker';
+ import { installAssistantFocusGuard } from './guards/assistant-focus';
++import { installKfChrome } from './guards/kf-chrome';
+ import { installKfLock } from './guards/kf-lock';
+ 
+ /**
+@@ -68,6 +69,7 @@ export function prepareEditorIframe(): boolean {
+       installAboutSourceNotice(doc);
+       const wasmBinaryHandled = releaseWasmBinary(win);
+       const kfLocked = installKfLock(win);
++      const kfChrome = installKfChrome(win);
+ 
+       if (
+         sharedWorkerShadowed &&
+@@ -78,7 +80,8 @@ export function prepareEditorIframe(): boolean {
+         x2tWorkerProxied &&
+         wasmBinaryHandled &&
+         assistantFocusGuarded &&
+-        kfLocked
++        kfLocked &&
++        kfChrome
+       ) {
+         fullyApplied = true;
+       }
+diff --git a/public/web-apps/apps/spreadsheeteditor/main/index.html b/public/web-apps/apps/spreadsheeteditor/main/index.html
+index 87274e7..da3576e 100644
+--- a/public/web-apps/apps/spreadsheeteditor/main/index.html
++++ b/public/web-apps/apps/spreadsheeteditor/main/index.html
+@@ -10,7 +10,7 @@
+         #status-sheets-bar-box { left: 64px !important; }
+     </style>
+     <style id="neutral-product-presentation">
+-        #header-logo, .brand-logo, .asc-about-office, #id-about-company-logo { display: none !important; }
++        #header-logo { display: none !important; }
+         #id-about-licensor-logo .asc-about-version:not(#id-about-licensor-version-name) { display: none !important; }
+     </style>
+     <title>Document Editor</title>

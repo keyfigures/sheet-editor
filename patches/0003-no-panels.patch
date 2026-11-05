@@ -1,0 +1,136 @@
+diff --git a/lib/onlyoffice/guards/kf-lock.ts b/lib/onlyoffice/guards/kf-lock.ts
+new file mode 100644
+index 0000000..14d03e5
+--- /dev/null
++++ b/lib/onlyoffice/guards/kf-lock.ts
+@@ -0,0 +1,64 @@
++import { isEmbedMode } from '../../embed-mode';
++
++/**
++ * The viewer's lock beyond the editor's own view restriction, which leaves the sheet strip live: its menu still
++ * offered Insert, Delete, Rename, Hide and Move on a locked file. So the strip's menu and double-click stop here, and
++ * the calls that change the sheet list do nothing, however they are reached. Print and save have no place in a viewer.
++ */
++const SHEET_LIST_CALLS = [
++  'asc_addWorksheet',
++  'asc_insertWorksheet',
++  'asc_deleteWorksheet',
++  'asc_moveWorksheet',
++  'asc_copyWorksheet',
++  'asc_renameWorksheet',
++  'asc_hideWorksheet',
++  'asc_unhideWorksheet',
++  'asc_setWorksheetTabColor',
++];
++const SHEET_STRIP = '#status-sheets-bar-box, #status-tabs-scroll';
++
++function stop(event: Event): void {
++  event.preventDefault();
++  event.stopImmediatePropagation();
++}
++
++export function swallowPrintAndSave(doc: Document): void {
++  doc.addEventListener(
++    'keydown',
++    (event) => {
++      const key = event.key.toLowerCase();
++      if ((event.metaKey || event.ctrlKey) && (key === 'p' || key === 's')) stop(event);
++      // On the grid it would be the browser's Back: in WebKit the whole viewer navigated away. A locked file has nothing
++      // to delete, and the boxes that take typing keep it.
++      const target = event.target as HTMLElement | null;
++      const box = target?.id === 'ce-cell-content' || target?.tagName === 'INPUT';
++      if (key === 'backspace' && !box) event.preventDefault();
++    },
++    { capture: true },
++  );
++}
++
++export function installKfLock(win: Window): boolean {
++  if (!isEmbedMode()) return true;
++  const w = win as unknown as { Asc?: { editor?: Record<string, unknown> }; __kfLocked?: boolean };
++  const api = w.Asc?.editor;
++  if (!api) return false;
++  if (w.__kfLocked) return true;
++  w.__kfLocked = true;
++  for (const name of SHEET_LIST_CALLS) {
++    if (typeof api[name] === 'function') api[name] = () => false;
++  }
++  const doc = win.document;
++  swallowPrintAndSave(doc);
++  for (const type of ['contextmenu', 'dblclick', 'dragstart']) {
++    doc.addEventListener(
++      type,
++      (event) => {
++        if ((event.target as Element | null)?.closest?.(SHEET_STRIP)) stop(event);
++      },
++      { capture: true },
++    );
++  }
++  return true;
++}
+diff --git a/lib/onlyoffice/iframe-guards.ts b/lib/onlyoffice/iframe-guards.ts
+index 7c8de39..b6ce1a8 100644
+--- a/lib/onlyoffice/iframe-guards.ts
++++ b/lib/onlyoffice/iframe-guards.ts
+@@ -17,6 +17,7 @@ import { installAboutSourceNotice } from './guards/about-source';
+ import { installBadImageUrlGuard } from './guards/bad-image-url';
+ import { installX2tWorkerProxy } from './guards/x2t-worker';
+ import { installAssistantFocusGuard } from './guards/assistant-focus';
++import { installKfLock } from './guards/kf-lock';
+ 
+ /**
+  * Same-origin preparation of the editor iframe, applied from onAppReady and
+@@ -66,6 +67,7 @@ export function prepareEditorIframe(): boolean {
+       const saveSemanticsInstalled = installServerlessSaveSemantics(win);
+       installAboutSourceNotice(doc);
+       const wasmBinaryHandled = releaseWasmBinary(win);
++      const kfLocked = installKfLock(win);
+ 
+       if (
+         sharedWorkerShadowed &&
+@@ -75,7 +77,8 @@ export function prepareEditorIframe(): boolean {
+         longActionGuarded &&
+         x2tWorkerProxied &&
+         wasmBinaryHandled &&
+-        assistantFocusGuarded
++        assistantFocusGuarded &&
++        kfLocked
+       ) {
+         fullyApplied = true;
+       }
+diff --git a/lib/onlyoffice/viewport.ts b/lib/onlyoffice/viewport.ts
+index e9e0853..d67f208 100644
+--- a/lib/onlyoffice/viewport.ts
++++ b/lib/onlyoffice/viewport.ts
+@@ -1,4 +1,5 @@
+ import { DOCUMENT_TYPE_MAP } from '@ranuts/shared/document-utils';
++import { isEmbedMode } from '../embed-mode';
+ import { getSdkEditorApi, measureEditorElementWidth } from './sdk-api';
+ 
+ /**
+@@ -32,6 +33,8 @@ export function readViewportMetrics(): ViewportMetrics {
+  * narrow -- a short but wide desktop window keeps its panels.
+  */
+ export function isCompactViewport(metrics: ViewportMetrics = readViewportMetrics()): boolean {
++  // A narrow panel on a desktop is not a phone, and this viewer has no panels to fold.
++  if (isEmbedMode()) return false;
+   const { width, height, coarsePointer } = metrics;
+   if (width <= 0) return false;
+   if (width <= COMPACT_VIEWPORT_MAX_WIDTH) return true;
+diff --git a/public/web-apps/apps/spreadsheeteditor/main/index.html b/public/web-apps/apps/spreadsheeteditor/main/index.html
+index 5be0aa0..87274e7 100644
+--- a/public/web-apps/apps/spreadsheeteditor/main/index.html
++++ b/public/web-apps/apps/spreadsheeteditor/main/index.html
+@@ -3,6 +3,12 @@
+ <head>
+     <!-- Modified 2026-09-26: neutral presentation; upstream attribution remains in About and NOTICE. -->
+     <link rel="icon" href="data:," />
++    <style id="kf-no-panels">
++        /* The viewer shows the formula bar, the grid, the sheet tabs and the zoom. Nothing else, from the first paint. */
++        #app-title, #box-doc-name, #header, #toolbar, .toolbar, #left-menu, #right-menu, #status-addtabs-box,
++        .loadmask > .brendpanel, .loadmask > .sktoolbar { display: none !important; }
++        #status-sheets-bar-box { left: 64px !important; }
++    </style>
+     <style id="neutral-product-presentation">
+         #header-logo, .brand-logo, .asc-about-office, #id-about-company-logo { display: none !important; }
+         #id-about-licensor-logo .asc-about-version:not(#id-about-licensor-version-name) { display: none !important; }

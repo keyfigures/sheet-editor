@@ -1,0 +1,24 @@
+diff --git a/packages/shared/src/document-utils.ts b/packages/shared/src/document-utils.ts
+index 7382c79..9dae82f 100644
+--- a/packages/shared/src/document-utils.ts
++++ b/packages/shared/src/document-utils.ts
+@@ -81,6 +81,7 @@ export const DOCUMENT_TYPE_MAP: Record<string, DocumentType> = {
+   rtf: 'word',
+   txt: 'word',
+   xlsx: 'cell',
++  xlsm: 'cell',
+   xls: 'cell',
+   ods: 'cell',
+   csv: 'cell',
+diff --git a/public/sdkjs/common/wasm/x2t/x2t_helper.js b/public/sdkjs/common/wasm/x2t/x2t_helper.js
+index db22ea3..c7152a7 100644
+--- a/public/sdkjs/common/wasm/x2t/x2t_helper.js
++++ b/public/sdkjs/common/wasm/x2t/x2t_helper.js
+@@ -396,6 +396,7 @@
+         this.binFileName = 'Editor.bin';
+ 
+         this.DOCUMENT_TYPE_MAP = {
++            xlsm: 'cell',
+             docx: 'word',
+             doc: 'word',
+             odt: 'word',

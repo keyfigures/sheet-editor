@@ -1,0 +1,56 @@
+diff --git a/lib/kf-bridge.ts b/lib/kf-bridge.ts
+index d11dc3f..c7ae63d 100644
+--- a/lib/kf-bridge.ts
++++ b/lib/kf-bridge.ts
+@@ -191,8 +191,27 @@ export function reportOpenFailure(kind: 'corrupt' | 'memory' | 'other'): void {
+   post('kf:error', { kind });
+ }
+ 
++/** This page's half of the guard in the editor's own index.html: no focus until the reader touches the viewer. */
++function guardFocus(): void {
++  let touched = false;
++  for (const type of ['pointerdown', 'mousedown', 'touchstart', 'keydown']) {
++    window.addEventListener(type, (event) => {
++      if (event.isTrusted) touched = true;
++    }, true);
++  }
++  const focusElement = HTMLElement.prototype.focus;
++  HTMLElement.prototype.focus = function focus(options?: FocusOptions): void {
++    if (touched) focusElement.call(this, options);
++  };
++  const focusWindow = window.focus;
++  window.focus = function focus(): void {
++    if (touched) focusWindow.call(window);
++  };
++}
++
+ export function startKfBridge(accept: (event: MessageEvent) => boolean, send: Post): void {
+   post = send;
++  guardFocus();
+   swallowPrintAndSave(document);
+   forwardKeys(document, null);
+   window.addEventListener('message', (event) => {
+diff --git a/public/web-apps/apps/spreadsheeteditor/main/index.html b/public/web-apps/apps/spreadsheeteditor/main/index.html
+index da3576e..985256c 100644
+--- a/public/web-apps/apps/spreadsheeteditor/main/index.html
++++ b/public/web-apps/apps/spreadsheeteditor/main/index.html
+@@ -3,6 +3,19 @@
+ <head>
+     <!-- Modified 2026-09-26: neutral presentation; upstream attribution remains in About and NOTICE. -->
+     <link rel="icon" href="data:," />
++    <script id="kf-focus-guard">
++    /* The editor focuses itself as it loads and on every jump: a reader typing in the app lost their words. */
++    (function () {
++        var touched = false;
++        ['pointerdown', 'mousedown', 'touchstart', 'keydown'].forEach(function (type) {
++            addEventListener(type, function (e) { if (e.isTrusted) touched = true; }, true);
++        });
++        var focusElement = HTMLElement.prototype.focus;
++        HTMLElement.prototype.focus = function (options) { if (touched) return focusElement.call(this, options); };
++        var focusWindow = window.focus;
++        window.focus = function () { if (touched) return focusWindow.call(window); };
++    })();
++    </script>
+     <style id="kf-no-panels">
+         /* The viewer shows the formula bar, the grid, the sheet tabs and the zoom. Nothing else, from the first paint. */
+         #app-title, #box-doc-name, #header, #toolbar, .toolbar, #left-menu, #right-menu, #status-addtabs-box,

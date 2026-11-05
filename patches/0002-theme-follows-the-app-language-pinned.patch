@@ -1,0 +1,99 @@
+diff --git a/lib/editor-theme.ts b/lib/editor-theme.ts
+index feaa55d..3ba151e 100644
+--- a/lib/editor-theme.ts
++++ b/lib/editor-theme.ts
+@@ -45,6 +45,14 @@ function storageSet(key: string, value: string): void {
+   }
+ }
+ 
++/**
++ * Embedded in the app, the theme is the app's and nothing else's: `theme=` in this page's address for the first
++ * paint, then kf:theme (lib/kf-bridge.ts). The OS, the site's theme and any stored choice are ignored.
++ */
++export function embedUiTheme(lightDefault: string, theme: string | null): string {
++  return theme === 'dark' ? DARK_UI_THEME : lightDefault;
++}
++
+ /** Effective site appearance right now. */
+ export function isSiteDark(): boolean {
+   const attr = document.documentElement.getAttribute(SITE_THEME_ATTR);
+@@ -130,6 +138,18 @@ export function applySiteThemeToEditor(lightDefault: string, root: Window = wind
+   return theme;
+ }
+ 
++/** kf:theme: the running editor changes at once, keeping the open file. */
++export function setEditorThemeFromApp(lightDefault: string, theme: string | null, root: Window = window): void {
++  const wanted = embedUiTheme(lightDefault, theme);
++  for (const api of editorThemeApis(root)) {
++    try {
++      if (api.currentThemeId?.() !== wanted) api.setTheme?.(wanted);
++    } catch {
++      // A frame mid-boot can throw; the app sends the theme again at kf:ready.
++    }
++  }
++}
++
+ /**
+  * Keep the editor following the site theme for the page's lifetime:
+  * observes ranui's <html data-ran-theme> flips and, for "system" mode
+diff --git a/lib/onlyoffice-editor.ts b/lib/onlyoffice-editor.ts
+index 4c8c330..b21b654 100644
+--- a/lib/onlyoffice-editor.ts
++++ b/lib/onlyoffice-editor.ts
+@@ -184,6 +184,8 @@ function createPersonalEditorInstance(config: {
+       // spreadsheet editor (found by the UI crawl).
+       coEditing: { mode: 'fast', change: false },
+       lang: editorLang,
++      // Numbers and dates read the same in every browser.
++      ...(isEmbedMode() ? { region: 'en-US' } : {}),
+       user: {
+         id: 'local-user',
+         name: 'Guest',
+diff --git a/lib/onlyoffice/ui-theme.ts b/lib/onlyoffice/ui-theme.ts
+index b648154..6492e78 100644
+--- a/lib/onlyoffice/ui-theme.ts
++++ b/lib/onlyoffice/ui-theme.ts
+@@ -1,4 +1,5 @@
+-import { installEditorThemeFollow, resolveEditorUiTheme } from '../editor-theme';
++import { embedUiTheme, installEditorThemeFollow, resolveEditorUiTheme } from '../editor-theme';
++import { isEmbedMode } from '../embed-mode';
+ 
+ /**
+  * Default interface theme for the editor. The v9 loader picks `theme-white`
+@@ -16,11 +17,20 @@ export const UI_THEME_STORAGE_KEY = 'ui-theme-id';
+ export function resolveUiTheme(): string {
+   // Follows the site's ranui theme (dark site -> theme-dark) unless the user
+   // picked a theme inside the editor; see lib/editor-theme.ts.
++  if (isEmbedMode()) {
++    // The editor reads its stored theme at boot, ahead of this one, and stores it again on every change.
++    try {
++      localStorage.removeItem(UI_THEME_STORAGE_KEY);
++    } catch {
++      // Storage can be blocked: then nothing is stored either.
++    }
++    return embedUiTheme(DEFAULT_UI_THEME, new URLSearchParams(location.search).get('theme'));
++  }
+   return resolveEditorUiTheme(DEFAULT_UI_THEME);
+ }
+ 
+ // Keep a mounted editor in step with the site theme (top-bar switch, OS
+ // switch in system mode) for the page's lifetime; idempotent per module.
+-if (typeof document !== 'undefined' && typeof MutationObserver !== 'undefined') {
++if (typeof document !== 'undefined' && typeof MutationObserver !== 'undefined' && !isEmbedMode()) {
+   installEditorThemeFollow(DEFAULT_UI_THEME);
+ }
+diff --git a/packages/shared/src/i18n.ts b/packages/shared/src/i18n.ts
+index 752d79e..266021b 100644
+--- a/packages/shared/src/i18n.ts
++++ b/packages/shared/src/i18n.ts
+@@ -280,7 +280,10 @@ class I18n {
+     // Priority: URL -> cookie -> saved choice -> preferred browser language.
+     // eslint-disable-next-line n/no-unsupported-features/node-builtins
+     const nav = typeof navigator === 'undefined' ? undefined : navigator;
++    // Embedded, this is the app's workbook viewer: always English, whatever the browser says.
++    const embedded = typeof window !== 'undefined' && window.parent !== window;
+     const preferredLocale =
++      (embedded ? 'en' : null) ||
+       this.getUrlParameter('locale') ||
+       this.getCookie('locale') ||
+       localStorageGetItem('document-lang') ||

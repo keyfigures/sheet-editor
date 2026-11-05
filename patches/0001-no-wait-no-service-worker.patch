@@ -1,0 +1,79 @@
+diff --git a/index.ts b/index.ts
+index 135c32f..bb52045 100644
+--- a/index.ts
++++ b/index.ts
+@@ -11,6 +11,7 @@ import {
+ import { getAllQueryString } from 'ranuts/utils';
+ import { View } from 'ranui/builder';
+ import { initEmbedApi } from './lib/embed-api';
++import { isEmbedMode } from './lib/embed-mode';
+ import { initEvents, setEventUICallbacks } from './lib/events';
+ import { onCreateNew, onOpenDocument, openDocumentFromUrl, openLocalFile, setUICallbacks } from './lib/document';
+ import { parseReadonly } from '@ranuts/shared/document-utils';
+@@ -224,7 +225,7 @@ void (async () => {
+ // "continue last time" line (public/history-recent.js) and /history.
+ 
+ // Register Service Worker for PWA
+-if ('serviceWorker' in navigator) {
++if ('serviceWorker' in navigator && !isEmbedMode()) {
+   // Update policy lives in lib/sw-update.ts: a new build's worker waits until
+   // no document is open, then takes over and the page reloads once.
+   const controllerAtBoot = navigator.serviceWorker.controller;
+diff --git a/lib/onlyoffice-editor.ts b/lib/onlyoffice-editor.ts
+index 223b986..4c8c330 100644
+--- a/lib/onlyoffice-editor.ts
++++ b/lib/onlyoffice-editor.ts
+@@ -1,7 +1,6 @@
+ import { isEmbedMode } from './embed-mode';
+ import { getDocumentCloseRevision } from './document-open';
+ import 'ranui/message';
+-import { waitForAppWorkerControl } from './offline-worker-control';
+ import { getOnlyOfficeLang, t } from '@ranuts/shared/i18n';
+ import { DOCUMENT_TYPE_MAP } from '@ranuts/shared/document-utils';
+ import { prepareEditorIframe } from './onlyoffice/iframe-guards';
+@@ -425,7 +424,6 @@ export function createEditorInstance(config: {
+ }
+ 
+ export async function loadEditorApi(): Promise<void> {
+-  if (!window.DocsAPI && /^\/editor(?:\.html)?\/?$/.test(location.pathname)) await waitForAppWorkerControl();
+   return new Promise((resolve, reject) => {
+     // Check if already loaded
+     if (window.DocsAPI) {
+diff --git a/public/web-apps/apps/api/documents/preload.html b/public/web-apps/apps/api/documents/preload.html
+index a005ec5..ffe6462 100644
+--- a/public/web-apps/apps/api/documents/preload.html
++++ b/public/web-apps/apps/api/documents/preload.html
+@@ -9,33 +9,6 @@
+     <style type="text/css"></style>
+ </head>
+ <body>
+-    <script>
+-+function registerServiceWorker() {
+-    if ('serviceWorker' in navigator && !(window.location.origin.lastIndexOf('file://', 0) === 0)) {
+-        const serviceWorkerName = 'document_editor_service_worker.js';
+-        const serviceWorkerPath = '../../../../' + serviceWorkerName;
+-        let reg;
+-        navigator.serviceWorker.register(serviceWorkerPath)
+-            .then(function (registration) {
+-                reg = registration;
+-                return navigator.serviceWorker.getRegistrations();
+-            })
+-            .then(function (registrations) {
+-                //delete stale service workers
+-                // for (const registration of registrations) {
+-                for (let r in registrations) {
+-                    const registration = registrations[r];
+-                    if (registration !== reg && registration.active && registration.active.scriptURL.endsWith(serviceWorkerName)) {
+-                        registration.unregister();
+-                    }
+-                }
+-            })
+-            .catch(function (err) {
+-                console.error('Registration failed with ' + err);
+-            });
+-    }
+-}();
+-</script>
+ 
+     <link rel="preload" as="script" href="../../../vendor/requirejs/require.js"/>
+     <script type="text/javascript" src="../../../vendor/jquery/jquery.min.js"></script>
